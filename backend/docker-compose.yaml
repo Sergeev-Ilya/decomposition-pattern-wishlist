@@ -1,0 +1,123 @@
+name: wishlist
+
+services:
+  auth-db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: wishlist_auth_app
+      POSTGRES_DB: wishlist_auth
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD:?Run node scripts/init-local-env.mjs first}
+    volumes:
+      - auth_data:/var/lib/postgresql
+    networks: [private]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+
+  wishlist-db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: wishlist_data_app
+      POSTGRES_DB: wishlist_data
+      POSTGRES_PASSWORD: ${WISHLIST_DB_PASSWORD:?Run node scripts/init-local-env.mjs first}
+    volumes:
+      - wishlist_data:/var/lib/postgresql
+    networks: [private]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+
+  auth-service:
+    build: ./auth-service
+    restart: unless-stopped
+    stop_grace_period: 10s
+    environment:
+      NODE_ENV: production
+      PORT: '3000'
+      DATABASE_URL: postgresql://wishlist_auth_app:${AUTH_DB_PASSWORD:?Run node scripts/init-local-env.mjs first}@auth-db:5432/wishlist_auth
+      JWT_SECRET: ${JWT_SECRET:?Run node scripts/init-local-env.mjs first}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:?Run node scripts/init-local-env.mjs first}
+      COOKIE_SECURE: 'false'
+    depends_on:
+      auth-db: { condition: service_healthy }
+    networks: [private]
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      start_period: 15s
+      retries: 10
+
+  wishlist-service:
+    build: ./wishlist-service
+    restart: unless-stopped
+    stop_grace_period: 10s
+    environment:
+      NODE_ENV: production
+      PORT: '3000'
+      DATABASE_URL: postgresql://wishlist_data_app:${WISHLIST_DB_PASSWORD:?Run node scripts/init-local-env.mjs first}@wishlist-db:5432/wishlist_data
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:?Run node scripts/init-local-env.mjs first}
+    depends_on:
+      wishlist-db: { condition: service_healthy }
+    networks: [private]
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      start_period: 15s
+      retries: 10
+
+  api-gateway:
+    build: ./api-gateway
+    restart: unless-stopped
+    stop_grace_period: 10s
+    environment:
+      NODE_ENV: production
+      PORT: '8080'
+      AUTH_SERVICE_URL: http://auth-service:3000
+      WISHLIST_SERVICE_URL: http://wishlist-service:3000
+      APP_ORIGIN: http://localhost:8880
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:?Run node scripts/init-local-env.mjs first}
+      UPSTREAM_TIMEOUT_MS: '5000'
+      TRUSTED_PROXY_IPS: ''
+    depends_on:
+      auth-service: { condition: service_healthy }
+      wishlist-service: { condition: service_healthy }
+    networks: [private]
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 10
+
+  frontend:
+    build: ../frontend
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:8880:80
+    depends_on:
+      api-gateway: { condition: service_healthy }
+    networks: [private]
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1/health]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 10
+
+networks:
+  private:
+    driver: bridge
+
+volumes:
+  auth_data:
+  wishlist_data:

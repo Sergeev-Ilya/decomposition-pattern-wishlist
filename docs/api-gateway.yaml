@@ -1,0 +1,788 @@
+openapi: 3.1.0
+info:
+  title: Wishlist Browser API
+  version: 1.0.0
+  description: |-
+    Единый контракт браузера: запросы к относительному /api на origin интерфейса.
+    Gateway разрешает только перечисленные методы и пути; снимает /api перед закрытым
+    upstream. /health обслуживает nginx, не gateway. /api/internal/* и произвольного proxy нет.
+    Неизвестный API-путь дает JSON 404 NOT_FOUND, неверный метод известного пути — 405
+    METHOD_NOT_ALLOWED с Allow. API-ошибка никогда не превращается в HTML SPA.
+
+    Все POST/PATCH/DELETE требуют точный Origin=APP_ORIGIN (локально http://localhost:8880),
+    X-Requested-With: Wishlist и Content-Type: application/json (charset допускается).
+    Отсутствующий/чужой Origin или неверный X-Requested-With дает 403 FORBIDDEN;
+    неподдерживаемый Content-Type — 415 UNSUPPORTED_MEDIA_TYPE, тело свыше 32 KiB —
+    413 REQUEST_TOO_LARGE, невалидный JSON — 400 VALIDATION_ERROR. Пустые по смыслу
+    POST и DELETE передают JSON {}. Межсайтовый CORS не включается.
+
+    JWT передается только cookie wishlist_session (HttpOnly, SameSite=Lax, Path=/,
+    Max-Age=86400, без Domain; Secure при HTTPS, false только для HTTP localhost).
+    В JSON, localStorage и sessionStorage JWT отсутствует. Frontend использует
+    credentials: same-origin, сервер проверяет подпись и действующую строку сессии.
+    На owner-маршрутах нужна действующая cookie. На /shared/* отсутствие cookie означает
+    гостя; присутствующая cookie всегда проверяется: невалидная — 401, отказ auth — 503,
+    timeout — 504. Ошибка не заменяется гостевым представлением. /reservations/* работает
+    по независимому секрету и игнорирует cookie, даже невалидную, без обращения к auth.
+    /auth/* проксируется в auth-service, который сам проверяет cookie там, где нужно;
+    logout не блокируется предварительной проверкой истекшего JWT. При сбое отзыва
+    действующей сессии возвращается ошибка, а не ложный успех/очистка cookie.
+
+    Gateway удаляет клиентские Authorization, X-Internal-* и X-User-*; только сам задает
+    внутренний credential и проверенный UUID. Set-Cookie от auth сохраняется. Внутренние
+    credentials и контекстные заголовки никогда не выдаются браузеру. Исходящие запросы
+    сервисам имеют ограниченный timeout; отказ/неверный upstream — 503, timeout — 504.
+
+    Все ответы имеют Cache-Control: no-store, Referrer-Policy: no-referrer,
+    X-Robots-Tag: noindex, nofollow; API также имеет X-Request-Id UUID. Общий формат ошибки
+    {error:{code,message},requestId}; без stacktrace, SQL, cookie и capability-токенов.
+    URL /s/*, /r/* и API с токенами, а также тела/секреты не попадают в access logs.
+
+    Лимиты на IP: регистрация/вход вместе 20 за 15 минут; создание броней 60 за минуту;
+    secret GET/cancel вместе 120 за минуту. Превышение — 429 RATE_LIMITED с Retry-After.
+    Счетчики локального экземпляра в памяти; распределенная защита не заявляется.
+    По умолчанию IP берется из socket.remoteAddress. Forwarded/X-Forwarded-For/X-Real-IP
+    не принимаются от произвольного caller; их можно использовать только от явно
+    настроенного доверенного nginx. Nginx перезаписывает, а не дополняет эти заголовки.
+servers:
+  - { url: http://localhost:8880, description: Согласованный локальный origin; APP_ORIGIN совпадает с этим origin. }
+security: []
+tags:
+  - { name: Auth, description: "Регистрация, вход и собственная сессия" }
+  - { name: Wishlists, description: Собственные списки и подарки }
+  - { name: Shared, description: Гостевой просмотр и бронирование }
+  - { name: Reservations, description: Независимый секрет управления бронью }
+x-gateway-policy:
+  allowlistOnly: true
+  rejectUnknownPath: 404
+  rejectWrongMethod: 405
+  exposeInternalRoutes: false
+  appOrigin: http://localhost:8880
+  unsafeHeaders: { Origin: APP_ORIGIN, X-Requested-With: Wishlist, Content-Type: application/json }
+  maxJsonBytes: 32768
+  outboundTimeoutMs: 5000
+  rejectClientIdentityHeaders: [ Authorization, X-Internal-*, X-User-* ]
+  defaultClientIpSource: socket.remoteAddress
+  forwardedHeaders: Только от явно настроенного доверенного nginx; иначе игнорируются.
+  noCredentialLogging: true
+paths:
+  /api/auth/register:
+    post:
+      operationId: register
+      summary: Создать пользователя и его первую сессию
+      description: |
+        Email обрезается по краям и приводится к нижнему регистру; пароль не обрезается
+        и не нормализуется. Пользователь и сессия создаются одной транзакцией.
+        При конфликте email ни сессия, ни cookie не создаются. Cookie выдается после commit.
+      requestBody: { $ref: "#/components/requestBodies/AuthCredentials" }
+      responses:
+        "201": { $ref: "#/components/responses/AuthAuthenticated" }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/AuthEmailConflict" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: []
+      tags: [ Auth ]
+      x-upstream: { service: auth-service, path: /auth/register, identity: delegated-auth }
+  /api/auth/login:
+    post:
+      operationId: login
+      summary: Войти и создать отдельную сессию на 24 часа
+      description: |
+        Неверный пароль и неизвестный email дают одинаковый INVALID_CREDENTIALS.
+        При успехе создается новая сессия; другие сессии не отзываются.
+        Email нормализуется как при регистрации, пароль сравнивается без изменений.
+      requestBody: { $ref: "#/components/requestBodies/AuthCredentials" }
+      responses:
+        "200": { $ref: "#/components/responses/AuthAuthenticated" }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "401": { $ref: "#/components/responses/AuthInvalidCredentials" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: []
+      tags: [ Auth ]
+      x-upstream: { service: auth-service, path: /auth/login, identity: delegated-auth }
+  /api/auth/me:
+    get:
+      operationId: getCurrentUser
+      summary: Проверить cookie и получить собственного пользователя
+      security: [ { sessionCookie: [] } ]
+      responses:
+        "200":
+          description: Подпись JWT, claims, срок и строка сессии проверены без кеша
+          content: { application/json: { schema: { $ref: "#/components/schemas/AuthUserResponse" } } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      tags: [ Auth ]
+      x-upstream: { service: auth-service, path: /auth/me, identity: delegated-auth }
+  /api/auth/logout:
+    post:
+      operationId: logout
+      summary: Отозвать текущую сессию и удалить cookie
+      description: |
+        Cookie необязательна: без нее либо с невалидным/истекшим JWT операция
+        идемпотентно возвращает 204 и очищает cookie. Для валидного неистекшего JWT
+        требуется успешный UPDATE собственной sessions по sid и sub, даже при повторе;
+        выход отзывает только текущую сессию. Если БД недоступна, возвращается 503,
+        cookie не удаляется и успешный отзыв не заявляется. Gateway всегда проксирует
+        logout, не блокируя его предварительной проверкой истекшей cookie.
+      responses:
+        "204":
+          description: Сессия отозвана либо уже не действует; без тела
+          headers:
+            Set-Cookie:
+              {
+                schema: { type: string },
+                description: wishlist_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure только при HTTPS.
+              }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: []
+      tags: [ Auth ]
+      x-upstream: { service: auth-service, path: /auth/logout, identity: delegated-auth }
+      requestBody: { $ref: "#/components/requestBodies/EmptyJson" }
+  /api/wishlists:
+    get:
+      operationId: listWishlists
+      summary: Все собственные списки, новые первыми
+      responses:
+        "200":
+          description: Без броней; пустой результат содержит пустой массив
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ wishlists ]
+                properties: { wishlists: { type: array, items: { $ref: "#/components/schemas/WishlistWishlistSummary" } } }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: [ { sessionCookie: [] } ]
+      tags: [ Wishlists ]
+      x-upstream: { service: wishlist-service, path: /wishlists, identity: required }
+    post:
+      operationId: createWishlist
+      summary: Создать список и непредсказуемую общую ссылку
+      requestBody:
+        {
+          required: true,
+          content: { application/json: { schema: { $ref: "#/components/schemas/WishlistWishlistInput" } } }
+        }
+      responses:
+        "201": { $ref: "#/components/responses/WishlistWishlist" }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: [ { sessionCookie: [] } ]
+      tags: [ Wishlists ]
+      x-upstream: { service: wishlist-service, path: /wishlists, identity: required }
+  /api/wishlists/{wishlistId}:
+    parameters: [ { $ref: "#/components/parameters/WishlistWishlistId" } ]
+    get:
+      operationId: getWishlist
+      summary: Собственный список с подарками без доступности и броней
+      responses:
+        "200": { $ref: "#/components/responses/WishlistWishlist" }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/WishlistNotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: [ { sessionCookie: [] } ]
+      tags: [ Wishlists ]
+      x-upstream: { service: wishlist-service, path: "/wishlists/{wishlistId}", identity: required }
+    patch:
+      operationId: updateWishlist
+      summary: Изменить название и/или описание собственного списка
+      requestBody:
+        {
+          required: true,
+          content: { application/json: { schema: { $ref: "#/components/schemas/WishlistWishlistPatch" } } }
+        }
+      responses:
+        "200": { $ref: "#/components/responses/WishlistWishlist" }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/WishlistNotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: [ { sessionCookie: [] } ]
+      tags: [ Wishlists ]
+      x-upstream: { service: wishlist-service, path: "/wishlists/{wishlistId}", identity: required }
+    delete:
+      operationId: deleteWishlist
+      summary: Удалить собственный список, подарки и их брони одной транзакцией
+      responses:
+        "204": { description: "Удалено; наличие броней не раскрывается, тело отсутствует" }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/WishlistNotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: [ { sessionCookie: [] } ]
+      tags: [ Wishlists ]
+      x-upstream: { service: wishlist-service, path: "/wishlists/{wishlistId}", identity: required }
+      requestBody: { $ref: "#/components/requestBodies/EmptyJson" }
+  /api/wishlists/{wishlistId}/gifts:
+    parameters: [ { $ref: "#/components/parameters/WishlistWishlistId" } ]
+    post:
+      operationId: createGift
+      summary: Добавить подарок; в списке не больше 100 подарков
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/WishlistGiftInput" } } } }
+      responses:
+        "201": { $ref: "#/components/responses/WishlistGift" }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/WishlistNotFound" }
+        "409": { $ref: "#/components/responses/WishlistConflict" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: [ { sessionCookie: [] } ]
+      tags: [ Wishlists ]
+      x-upstream: { service: wishlist-service, path: "/wishlists/{wishlistId}/gifts", identity: required }
+  /api/wishlists/{wishlistId}/gifts/{giftId}:
+    parameters:
+      - { $ref: "#/components/parameters/WishlistWishlistId" }
+      - { $ref: "#/components/parameters/WishlistGiftId" }
+    patch:
+      operationId: updateGift
+      summary: Изменить подарок с сохранением брони и увеличением version
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/WishlistGiftPatch" } } } }
+      responses:
+        "200": { $ref: "#/components/responses/WishlistGift" }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/WishlistNotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: [ { sessionCookie: [] } ]
+      tags: [ Wishlists ]
+      x-upstream: { service: wishlist-service, path: "/wishlists/{wishlistId}/gifts/{giftId}", identity: required }
+    delete:
+      operationId: deleteGift
+      summary: Удалить подарок и его брони без раскрытия их наличия
+      responses:
+        "204": { description: Удалено; тело отсутствует }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/WishlistNotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: [ { sessionCookie: [] } ]
+      tags: [ Wishlists ]
+      x-upstream: { service: wishlist-service, path: "/wishlists/{wishlistId}/gifts/{giftId}", identity: required }
+      requestBody: { $ref: "#/components/requestBodies/EmptyJson" }
+  /api/wishlists/{wishlistId}/share-link:
+    parameters: [ { $ref: "#/components/parameters/WishlistWishlistId" } ]
+    post:
+      operationId: rotateShareLink
+      summary: Заменить общую ссылку; старая сразу недействительна, брони сохранены
+      requestBody: { $ref: "#/components/requestBodies/WishlistEmpty" }
+      responses:
+        "200":
+          description: Новый токен; UI собирает ссылку как origin + /s/ + shareToken
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ shareToken ]
+                properties: { shareToken: { $ref: "#/components/schemas/WishlistCapabilityToken" } }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/WishlistNotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: [ { sessionCookie: [] } ]
+      tags: [ Wishlists ]
+      x-upstream: { service: wishlist-service, path: "/wishlists/{wishlistId}/share-link", identity: required }
+  /api/shared/{shareToken}:
+    parameters: [ { $ref: "#/components/parameters/WishlistShareToken" } ]
+    get:
+      operationId: getSharedWishlist
+      summary: Открыть общий список с представлением владельца или гостя
+      description: |-
+        Без cookie посетитель — гость. Для владельца isOwner=true и ни один подарок
+        не содержит reserved, даже false. Для остальных isOwner=false и каждый подарок
+        имеет reserved boolean. Нет ownerId, email, имени, shareToken или чужих секретов.
+        При наличии cookie gateway проверяет ее и не заменяет ошибку auth гостевым режимом.
+
+        Браузер не передает user-id: gateway извлекает контекст только из проверенной cookie.
+        Для cookie отсутствующей — гость; невалидной — 401, отказа auth — 503, timeout — 504.
+      responses:
+        "200":
+          description: Явная безопасная проекция для текущего посетителя
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ wishlist ]
+                properties:
+                  wishlist:
+                    {
+                      oneOf:
+                        [
+                          { $ref: "#/components/schemas/WishlistSharedOwnerWishlist" },
+                          { $ref: "#/components/schemas/WishlistSharedGuestWishlist" }
+                        ]
+                    }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/WishlistNotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: []
+      tags: [ Shared ]
+      x-upstream: { service: wishlist-service, path: "/shared/{shareToken}", identity: optional-cookie }
+  /api/shared/{shareToken}/gifts/{giftId}/reservations:
+    parameters:
+      - { $ref: "#/components/parameters/WishlistShareToken" }
+      - { $ref: "#/components/parameters/WishlistGiftId" }
+    post:
+      operationId: reserveGift
+      summary: Атомарно забронировать свободный подарок без регистрации
+      description: |-
+        Под блокировкой списка повторно проверяются действующий shareToken и подарок.
+        Авторизованный владелец получает 403. Из одновременных заявок успешна одна,
+        остальные получают 409 GIFT_RESERVED. После commit возвращается единственный
+        открытый секрет; при сетевой неопределенности автоматического повтора нет.
+
+        Browser не передает user-id: gateway извлекает контекст только из проверенной cookie.
+        Для cookie отсутствующей — гость; невалидной — 401, отказа auth — 503, timeout — 504.
+      requestBody: { $ref: "#/components/requestBodies/WishlistEmpty" }
+      responses:
+        "201":
+          description: Сохранить личную ссылку origin + /r/ + reservationToken; этот секрет выдается только здесь
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ reservationToken ]
+                properties: { reservationToken: { $ref: "#/components/schemas/WishlistCapabilityToken" } }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/WishlistNotFound" }
+        "409": { $ref: "#/components/responses/WishlistConflict" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: []
+      tags: [ Shared ]
+      x-upstream:
+        {
+          service: wishlist-service,
+          path: "/shared/{shareToken}/gifts/{giftId}/reservations",
+          identity: optional-cookie
+        }
+  /api/reservations/{reservationToken}:
+    parameters: [ { $ref: "#/components/parameters/WishlistReservationToken" } ]
+    get:
+      operationId: getReservation
+      summary: Посмотреть свою активную или отмененную бронь по секрету
+      description: >-
+        Не зависит от cookie, auth-service и текущего shareToken. Возвращает текущую карточку и giftChanged, но не
+        эхотокен.
+
+        Cookie полностью игнорируется; проверка сессии не выполняется, работа auth не требуется.
+      responses:
+        "200": { $ref: "#/components/responses/WishlistReservation" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/WishlistNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: []
+      tags: [ Reservations ]
+      x-upstream: { service: wishlist-service, path: "/reservations/{reservationToken}", identity: ignore-cookie }
+  /api/reservations/{reservationToken}/cancel:
+    parameters: [ { $ref: "#/components/parameters/WishlistReservationToken" } ]
+    post:
+      operationId: cancelReservation
+      summary: Идемпотентно отменить только соответствующую секрету бронь
+      description: |-
+        После отмены строка сохраняется для просмотра. Повторная отмена дает тот же статус
+        canceled и прежний canceledAt; новая бронь подарка по старому секрету не меняется.
+        Удаленный подарок/список или неизвестный секрет дает нейтральный 404.
+
+        Cookie полностью игнорируется; проверка сессии не выполняется, работа auth не требуется.
+      requestBody: { $ref: "#/components/requestBodies/WishlistEmpty" }
+      responses:
+        "200": { $ref: "#/components/responses/WishlistReservation" }
+        "400": { $ref: "#/components/responses/InvalidInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/WishlistNotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504": { $ref: "#/components/responses/Timeout" }
+      security: []
+      tags: [ Reservations ]
+      x-upstream: { service: wishlist-service, path: "/reservations/{reservationToken}/cancel", identity: ignore-cookie }
+  /health:
+    get:
+      operationId: frontendHealth
+      summary: Готовность nginx интерфейса; не заменяет API smoke и health бизнес-сервисов
+      security: []
+      responses:
+        "200":
+          description: nginx обслуживает интерфейс
+          content:
+            application/json:
+              {
+                schema: { type: object, additionalProperties: false, required: [ status ], properties: { status: { const: ok } } }
+              }
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: wishlist_session
+      description: JWT HS256; HttpOnly, SameSite=Lax, Path=/, без Domain. Срок 24 часа; Secure при HTTPS.
+  schemas:
+    Error:
+      type: object
+      additionalProperties: false
+      required: [ error, requestId ]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [ code, message ]
+          properties: { code: { type: string }, message: { type: string, description: "Без stacktrace, SQL, пароля, cookie или JWT." } }
+        requestId:
+          type: string
+          format: uuid
+          description: Создается gateway/сервисом; входной X-Request-Id принимается только как валидный UUID от доверенного
+            gateway.
+    AuthCredentials:
+      type: object
+      additionalProperties: false
+      required: [ email, password ]
+      properties:
+        email:
+          type: string
+          maxLength: 1024
+          description: Сырая строка до 1024 символов; после trim/lowercase обязательны формат email и длина до 254. Краевые
+            пробелы допустимы.
+        password:
+          type: string
+          minLength: 12
+          maxLength: 128
+          description: Не trim и не normalize. Длина в Unicode code points, затем UTF-8 для scrypt.
+    AuthUser:
+      type: object
+      additionalProperties: false
+      required: [ id, email, displayName, createdAt ]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email, maxLength: 254 }
+        displayName:
+          {
+            type: string,
+            description: "Локальная часть email; только для собственного кабинета, не для публичного списка."
+          }
+        createdAt: { type: string, format: date-time }
+    AuthUserResponse:
+      {
+        type: object,
+        additionalProperties: false,
+        required: [ user ],
+        properties: { user: { $ref: "#/components/schemas/AuthUser" } }
+      }
+    WishlistCapabilityToken:
+      {
+        type: string,
+        pattern: "^[A-Za-z0-9_-]{43}$",
+        description: "32 случайных байта, base64url без padding; 256 бит энтропии."
+      }
+    WishlistTitle:
+      {
+        type: string,
+        minLength: 1,
+        maxLength: 200,
+        description: "Обрезается по краям, после trim не может быть пустым."
+      }
+    WishlistDescription: { type: string, maxLength: 2000, default: "", description: "Обрезается по краям; простой текст, не HTML." }
+    WishlistPriceKopecks:
+      type: integer
+      minimum: 0
+      maximum: 9007199254740991
+      description: Точное целое число копеек, не рубли. Дробные JSON-числа отклоняются.
+    WishlistGiftUrl:
+      type: string
+      maxLength: 4096
+      default: ""
+      description: Пустая строка либо абсолютный http/https URL без логина/пароля. Сервер не скачивает URL.
+    WishlistWishlistInput:
+      type: object
+      additionalProperties: false
+      required: [ title ]
+      properties:
+        {
+          title: { $ref: "#/components/schemas/WishlistTitle" },
+          description: { $ref: "#/components/schemas/WishlistDescription" }
+        }
+    WishlistWishlistPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        {
+          title: { $ref: "#/components/schemas/WishlistTitle" },
+          description: { $ref: "#/components/schemas/WishlistDescription" }
+        }
+    WishlistGiftInput:
+      type: object
+      additionalProperties: false
+      required: [ title, priceKopecks ]
+      properties:
+        title: { $ref: "#/components/schemas/WishlistTitle" }
+        priceKopecks: { $ref: "#/components/schemas/WishlistPriceKopecks" }
+        url: { $ref: "#/components/schemas/WishlistGiftUrl" }
+        note: { $ref: "#/components/schemas/WishlistDescription" }
+    WishlistGiftPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        title: { $ref: "#/components/schemas/WishlistTitle" }
+        priceKopecks: { $ref: "#/components/schemas/WishlistPriceKopecks" }
+        url: { $ref: "#/components/schemas/WishlistGiftUrl" }
+        note: { $ref: "#/components/schemas/WishlistDescription" }
+    WishlistWishlistSummary:
+      type: object
+      additionalProperties: false
+      required: [ id, title, description, shareToken, giftCount, createdAt, updatedAt ]
+      properties:
+        id: { type: string, format: uuid }
+        title: { $ref: "#/components/schemas/WishlistTitle" }
+        description: { type: string }
+        shareToken: { $ref: "#/components/schemas/WishlistCapabilityToken" }
+        giftCount: { type: integer, minimum: 0, maximum: 100 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    WishlistWishlistDetail:
+      allOf:
+        - { $ref: "#/components/schemas/WishlistWishlistSummaryFields" }
+        - type: object
+          required: [ gifts ]
+          properties: { gifts: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/WishlistGift" } } }
+      unevaluatedProperties: false
+    WishlistWishlistSummaryFields:
+      type: object
+      required: [ id, title, description, shareToken, giftCount, createdAt, updatedAt ]
+      properties:
+        id: { type: string, format: uuid }
+        title: { $ref: "#/components/schemas/WishlistTitle" }
+        description: { type: string }
+        shareToken: { $ref: "#/components/schemas/WishlistCapabilityToken" }
+        giftCount: { type: integer, minimum: 0, maximum: 100 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    WishlistGift:
+      type: object
+      additionalProperties: false
+      required: [ id, wishlistId, title, priceKopecks, currency, url, note, version, createdAt, updatedAt ]
+      properties:
+        id: { type: string, format: uuid }
+        wishlistId: { type: string, format: uuid }
+        title: { $ref: "#/components/schemas/WishlistTitle" }
+        priceKopecks: { $ref: "#/components/schemas/WishlistPriceKopecks" }
+        currency: { const: RUB }
+        url: { type: string }
+        note: { type: string }
+        version: { type: integer, minimum: 1 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    WishlistPublicGiftFields:
+      type: object
+      required: [ id, title, priceKopecks, currency, url, note ]
+      properties:
+        id: { type: string, format: uuid }
+        title: { $ref: "#/components/schemas/WishlistTitle" }
+        priceKopecks: { $ref: "#/components/schemas/WishlistPriceKopecks" }
+        currency: { const: RUB }
+        url: { type: string }
+        note: { type: string }
+    WishlistSharedOwnerGift: { allOf: [ { $ref: "#/components/schemas/WishlistPublicGiftFields" } ], unevaluatedProperties: false }
+    WishlistSharedGuestGift:
+      allOf:
+        - { $ref: "#/components/schemas/WishlistPublicGiftFields" }
+        - { type: object, required: [ reserved ], properties: { reserved: { type: boolean } } }
+      unevaluatedProperties: false
+    WishlistSharedOwnerWishlist:
+      type: object
+      additionalProperties: false
+      required: [ id, title, description, isOwner, gifts ]
+      properties:
+        id: { type: string, format: uuid }
+        title: { $ref: "#/components/schemas/WishlistTitle" }
+        description: { type: string }
+        isOwner: { const: true }
+        gifts: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/WishlistSharedOwnerGift" } }
+    WishlistSharedGuestWishlist:
+      type: object
+      additionalProperties: false
+      required: [ id, title, description, isOwner, gifts ]
+      properties:
+        id: { type: string, format: uuid }
+        title: { $ref: "#/components/schemas/WishlistTitle" }
+        description: { type: string }
+        isOwner: { const: false }
+        gifts: { type: array, maxItems: 100, items: { $ref: "#/components/schemas/WishlistSharedGuestGift" } }
+    WishlistReservationView:
+      type: object
+      additionalProperties: false
+      required: [ id, status, createdAt, canceledAt, giftChanged, gift ]
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [ active, canceled ] }
+        createdAt: { type: string, format: date-time }
+        canceledAt: { type: [ string, "null" ], format: date-time }
+        giftChanged: { type: boolean, description: Текущая gift.version отличается от сохраненной при бронировании. }
+        gift: { $ref: "#/components/schemas/WishlistGift" }
+  parameters:
+    WishlistWishlistId: { name: wishlistId, in: path, required: true, schema: { type: string, format: uuid } }
+    WishlistGiftId: { name: giftId, in: path, required: true, schema: { type: string, format: uuid } }
+    WishlistShareToken:
+      name: shareToken
+      in: path
+      required: true
+      description: Неверный формат и неизвестное значение одинаково дают 404.
+      schema: { $ref: "#/components/schemas/WishlistCapabilityToken" }
+    WishlistReservationToken:
+      name: reservationToken
+      in: path
+      required: true
+      description: Неверный формат и неизвестное значение одинаково дают 404; токен не журналируется.
+      schema: { $ref: "#/components/schemas/WishlistCapabilityToken" }
+  requestBodies:
+    AuthCredentials: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/AuthCredentials" } } } }
+    WishlistEmpty: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+    EmptyJson: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+  responses:
+    AuthAuthenticated:
+      description: Пользователь и новая сессия; JWT отсутствует в JSON
+      headers:
+        Set-Cookie:
+          schema: { type: string }
+          description: wishlist_session=<JWT>; Max-Age=86400; Path=/; HttpOnly; SameSite=Lax; Secure только при HTTPS.
+      content: { application/json: { schema: { $ref: "#/components/schemas/AuthUserResponse" } } }
+    InvalidInput:
+      description: 400 VALIDATION_ERROR — неверный JSON, UUID или значение; неизвестные поля запрещены. Неверные
+        capability-токены дают 404, а не подробную ошибку.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    AuthInvalidCredentials:
+      description: 401 INVALID_CREDENTIALS — общее сообщение для неизвестного email и неверного пароля
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unauthenticated:
+      description: 401 UNAUTHENTICATED — cookie отсутствует там, где нужна, невалидна, истекла или сессия отозвана. На
+        /shared/* анонимность допускается только при отсутствии cookie.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Forbidden:
+      description: 403 FORBIDDEN — неверный/отсутствующий Origin или X-Requested-With; OWN_WISHLIST — авторизованный
+        владелец не может бронировать свой подарок.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    AuthEmailConflict:
+      description: 409 EMAIL_IN_USE — нормализованный email уже зарегистрирован
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    RateLimited:
+      description: 429 RATE_LIMITED — превышен лимит соответствующей группы запросов на IP.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+      headers: { Retry-After: { schema: { type: integer, minimum: 1 }, description: Секунды до следующей допустимой попытки } }
+    Unavailable:
+      description: 503 SERVICE_UNAVAILABLE — БД или зависимость недоступна. Нет перехода в гостевой режим, выдачи сессии
+        или ложного успеха logout.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    WishlistWishlist:
+      description: Собственный список; подарки по createdAt/id по возрастанию, без любых полей брони
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [ wishlist ]
+            properties: { wishlist: { $ref: "#/components/schemas/WishlistWishlistDetail" } }
+    WishlistGift:
+      description: Созданная или измененная карточка; без любых полей брони
+      content:
+        application/json:
+          schema:
+            {
+              type: object,
+              additionalProperties: false,
+              required: [ gift ],
+              properties: { gift: { $ref: "#/components/schemas/WishlistGift" } }
+            }
+    WishlistReservation:
+      description: Только соответствующая секрету бронь; secret/shareToken/ownerId отсутствуют
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [ reservation ]
+            properties: { reservation: { $ref: "#/components/schemas/WishlistReservationView" } }
+    WishlistNotFound:
+      description: 404 NOT_FOUND — объект/ссылка/бронь недоступны; без уточнения причины
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    WishlistConflict:
+      description: 409 GIFT_RESERVED — подарок занят; GIFT_LIMIT_REACHED — достигнут предел 100 подарков
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Timeout:
+      description: 504 GATEWAY_TIMEOUT — запрос к зависимости превысил 5 секунд; мутация могла завершиться,
+        автоматического retry POST бронирования нет.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    TooLarge:
+      description: 413 REQUEST_TOO_LARGE — JSON-тело больше 32768 байт.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    UnsupportedMedia:
+      description: 415 UNSUPPORTED_MEDIA_TYPE — для небезопасного метода требуется application/json; charset допустим.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }

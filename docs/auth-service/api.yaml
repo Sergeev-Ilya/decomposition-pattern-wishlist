@@ -1,0 +1,207 @@
+openapi: 3.1.0
+info:
+  title: Wishlist Auth Service
+  version: 1.0.0
+  description: |
+    Внутренний сервис идентификации. Gateway публикует /auth/* как /api/auth/*,
+    снимает /api и сам устанавливает X-Internal-Token. Все маршруты, кроме /health,
+    требуют внутренний credential; X-User-Id и Bearer от клиента не авторизуют запрос.
+    Gateway проверяет Origin=APP_ORIGIN и X-Requested-With=Wishlist на всех POST,
+    Content-Type application/json, лимит тела 32 KiB и частоту входа/регистрации.
+    Он не публикует /internal/*. JWT передается только HttpOnly cookie, никогда JSON.
+    Ответы имеют Cache-Control: no-store и Referrer-Policy: no-referrer.
+servers:
+  - url: http://auth-service:3000
+security:
+  - internalToken: []
+paths:
+  /health:
+    get:
+      operationId: authHealth
+      summary: Готовность сервиса и соединения с собственной БД
+      security: []
+      responses:
+        '200':
+          description: БД доступна, миграции применены
+          content:
+            application/json:
+              schema: { type: object, required: [status], additionalProperties: false, properties: { status: { const: ok } } }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /auth/register:
+    post:
+      operationId: register
+      summary: Создать пользователя и его первую сессию
+      description: |
+        Email обрезается по краям и приводится к нижнему регистру; пароль не обрезается
+        и не нормализуется. Пользователь и сессия создаются одной транзакцией.
+        При конфликте email ни сессия, ни cookie не создаются. Cookie выдается после commit.
+      requestBody: { $ref: '#/components/requestBodies/Credentials' }
+      responses:
+        '201': { $ref: '#/components/responses/Authenticated' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/EmailConflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /auth/login:
+    post:
+      operationId: login
+      summary: Войти и создать отдельную сессию на 24 часа
+      description: |
+        Неверный пароль и неизвестный email дают одинаковый INVALID_CREDENTIALS.
+        При успехе создается новая сессия; другие сессии не отзываются.
+        Email нормализуется как при регистрации, пароль сравнивается без изменений.
+      requestBody: { $ref: '#/components/requestBodies/Credentials' }
+      responses:
+        '200': { $ref: '#/components/responses/Authenticated' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/InvalidCredentials' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /auth/me:
+    get:
+      operationId: getCurrentUser
+      summary: Проверить cookie и получить собственного пользователя
+      security:
+        - internalToken: []
+          sessionCookie: []
+      responses:
+        '200':
+          description: Подпись JWT, claims, срок и строка сессии проверены без кеша
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /auth/logout:
+    post:
+      operationId: logout
+      summary: Отозвать текущую сессию и удалить cookie
+      description: |
+        Cookie необязательна: без нее либо с невалидным/истекшим JWT операция
+        идемпотентно возвращает 204 и очищает cookie. Для валидного неистекшего JWT
+        требуется успешный UPDATE собственной sessions по sid и sub, даже при повторе;
+        выход отзывает только текущую сессию. Если БД недоступна, возвращается 503,
+        cookie не удаляется и успешный отзыв не заявляется. Gateway всегда проксирует
+        logout, не блокируя его предварительной проверкой истекшей cookie.
+      responses:
+        '204':
+          description: Сессия отозвана либо уже не действует; без тела
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: 'wishlist_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure только при HTTPS.'
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /internal/sessions/validate:
+    post:
+      operationId: validateSession
+      summary: Закрытая проверка JWT и действующей строки сессии для gateway
+      description: |
+        JWT поступает только по внутренней сети; не журналируется. Проверяются HS256,
+        iss=wishlist-auth, aud=wishlist-web, sub/sid UUID, iat/exp и совпадение с sessions.
+        revoked_at должен быть NULL, expires_at больше текущего времени.
+        Положительные ответы не кешируются. Этот маршрут не доступен через /api.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false, required: [token], properties: { token: { type: string, minLength: 1, maxLength: 4096 } } }
+      responses:
+        '200':
+          description: Внутренний контекст; sessionId не возвращается публичным API
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [user, sessionId, expiresAt]
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+                  sessionId: { type: string, format: uuid }
+                  expiresAt: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+components:
+  securitySchemes:
+    internalToken: { type: apiKey, in: header, name: X-Internal-Token, description: 'Секрет из INTERNAL_TOKEN, сравнивается constant-time; отсутствующий/неверный дает 403.' }
+    sessionCookie: { type: apiKey, in: cookie, name: wishlist_session, description: 'JWT HS256; HttpOnly, SameSite=Lax, Path=/, без Domain. Срок 24 часа; Secure при HTTPS.' }
+  schemas:
+    Credentials:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email: { type: string, maxLength: 1024, description: 'Сырая строка до 1024 символов; после trim/lowercase обязательны формат email и длина до 254. Краевые пробелы допустимы.' }
+        password: { type: string, minLength: 12, maxLength: 128, description: 'Не trim и не normalize. Длина в Unicode code points, затем UTF-8 для scrypt.' }
+    User:
+      type: object
+      additionalProperties: false
+      required: [id, email, displayName, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email, maxLength: 254 }
+        displayName: { type: string, description: 'Локальная часть email; только для собственного кабинета, не для публичного списка.' }
+        createdAt: { type: string, format: date-time }
+    UserResponse:
+      type: object
+      additionalProperties: false
+      required: [user]
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error, requestId]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string, description: 'Без stacktrace, SQL, пароля, cookie или JWT.' }
+        requestId: { type: string, format: uuid, description: 'Создается gateway/сервисом; входной X-Request-Id принимается только как валидный UUID от доверенного gateway.' }
+  requestBodies:
+    Credentials:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Credentials' }
+  responses:
+    Authenticated:
+      description: Пользователь и новая сессия; JWT отсутствует в JSON
+      headers:
+        Set-Cookie:
+          schema: { type: string }
+          description: 'wishlist_session=<JWT>; Max-Age=86400; Path=/; HttpOnly; SameSite=Lax; Secure только при HTTPS.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UserResponse' }
+    InvalidInput:
+      description: '400 VALIDATION_ERROR — JSON/поля/формат/длина некорректны'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    InvalidCredentials:
+      description: '401 INVALID_CREDENTIALS — общее сообщение для неизвестного email и неверного пароля'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthenticated:
+      description: '401 UNAUTHENTICATED — cookie/JWT отсутствует, невалиден, истек или сессия отозвана'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: '403 FORBIDDEN — неверный внутренний credential; на gateway также чужой/отсутствующий Origin или X-Requested-With'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    EmailConflict:
+      description: '409 EMAIL_IN_USE — нормализованный email уже зарегистрирован'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    RateLimited:
+      description: '429 RATE_LIMITED — gateway ограничивает вход/регистрацию до 20 попыток за 15 минут на IP'
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 1 }, description: 'Секунды до следующей допустимой попытки' }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unavailable:
+      description: '503 SERVICE_UNAVAILABLE — БД или зависимость недоступна, без успеха и без выдачи/очистки session cookie'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }

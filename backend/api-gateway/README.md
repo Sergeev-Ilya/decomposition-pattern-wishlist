@@ -1,0 +1,15 @@
+# Wishlist API gateway
+
+Stateless Node.js 24 / Express 5 service. No database or JWT secret. Only the browser routes in `docs/api-gateway.yaml` are forwarded; `/health` reports this process's health. Compose is maintained separately.
+
+Run `npm install`, `npm run build`, `npm test`, then configure environment variables using `.env.example` and run `npm start`. Build the container from this directory with `docker build -t wishlist-api-gateway .`. The runtime contains compiled JavaScript and production dependencies, runs as the `node` user, and handles SIGTERM/SIGINT gracefully.
+
+`AUTH_SERVICE_URL` and `WISHLIST_SERVICE_URL` are required HTTP(S) origins without paths or credentials. `INTERNAL_TOKEN` is required, at least 32 bytes, and must match both services. Generate it outside source control (for example `openssl rand -hex 32`). `APP_ORIGIN` defaults to `http://localhost:8880`; `PORT` defaults to 8080 and `UPSTREAM_TIMEOUT_MS` to 5000. No secret has a default. Upstream redirects are errors; requests have no automatic retry.
+
+Owner requests validate the session through auth on every request. Public shared requests allow guests only when the session cookie is absent. Empty, duplicate, malformed or invalid session cookies fail closed. Reservation secret routes ignore cookies and auth availability. Auth routes delegate cookie validation; logout can clear an expired cookie. Only the session cookie goes to auth, and no cookie goes to wishlist. Identity and internal headers are rebuilt, never copied from clients. Auth responses are rebuilt from the public user fields and preserve Set-Cookie with `Headers.getSetCookie()`.
+
+Every POST/PATCH/DELETE requires the exact configured Origin, `X-Requested-With: Wishlist`, and JSON Content-Type, with a 32 KiB limit. Empty operations and DELETE require `{}`; invalid JSON, non-object bodies and unknown fields on empty operations are rejected. Other field validation remains with the owning service. Responses use JSON errors with generated UUID request IDs, no-store/no-referrer/noindex headers. Upstream error messages, headers and response lengths/encodings are not copied. This service emits startup status only, with no access, URL, body, cookie, credential or capability logs.
+
+In-memory fixed-window limits share counters across login/register (20/15 min/IP), reservations (60/min/IP), and secret read/cancel (120/min/IP). Each instance has independent counters. The default IP comes from the socket; client forwarding headers are ignored. `TRUSTED_PROXY_IPS` optionally lists exact socket addresses of trusted nginx proxies, which must overwrite `X-Forwarded-For` with one validated client IP. Use the socket's actual address form, including IPv4-mapped IPv6 when applicable; there is no broad trust-proxy/hop-count setting. With no trusted proxy configuration, traffic behind nginx shares a limit bucket.
+
+Tests inject the upstream fetch function and clock to verify trust boundaries, auth failure behavior, routing, cookie preservation, timeouts, request guards and rate windows without databases.

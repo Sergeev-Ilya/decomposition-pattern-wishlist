@@ -1,0 +1,14 @@
+@import "tailwindcss";
+
+body {
+  @apply m-0 bg-[#f8f8f0] font-sans text-[#292c24] antialiased;
+}
+button, a, input, textarea {
+  -webkit-tap-highlight-color: transparent;
+}
+button:not(:disabled), a {
+  cursor: pointer;
+}
+::selection {
+  background: #f3cc5880;
+}

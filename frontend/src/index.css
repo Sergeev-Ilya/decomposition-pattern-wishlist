@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+body {
+  @apply m-0 bg-[#f8f8f0] font-sans text-[#292c24] antialiased;
+}
+button, a, input, textarea {
+  -webkit-tap-highlight-color: transparent;
+}
+button:not(:disabled), a {
+  cursor: pointer;
+}
+::selection {
+  background: #f3cc5880;
+}
+
+/* User text must wrap even when a title or note contains no spaces. */
+h1, h2, h3, p, article, dialog { overflow-wrap: anywhere; }
+main, section, article { min-width: 0; }
